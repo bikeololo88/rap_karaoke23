@@ -378,6 +378,25 @@ def find_lyrics(artist: str, title: str):
 # ══════════════════════════════════════════════════════════════════════════════
 #  ШАГ 3 — Whisper STT / WhisperX (С КЭШЕМ)
 # ══════════════════════════════════════════════════════════════════════════════
+def _safe_gpu() -> "GPU":
+    """
+    Возвращает GPU-объект. Если при первом использовании ctranslate2/torch
+    бросает RuntimeError о несовместимости CUDA-драйвера — переключаемся на CPU
+    и сбрасываем кэш детектора.
+    """
+    return gpu()
+
+
+def _cpu_fallback_gpu() -> "GPU":
+    """Создаёт GPU-объект форсированно на CPU."""
+    g = GPU.__new__(GPU)
+    import platform, multiprocessing
+    g.backend, g.device, g.torch_device = "cpu", "cpu", "cpu"
+    g.compute_type = "int8"
+    g.name = f"CPU-fallback ({platform.processor() or 'unknown'}, {multiprocessing.cpu_count()} ядер)"
+    return g
+
+
 def get_timings(vocals: Path, file_hash: str, pre_timed: Optional[list[dict]], plain_lyrics: Optional[str], model_name: str, lang: str, no_align: bool) -> list[dict]:
     t_cache = CACHE_DIR / f"{file_hash}_timings.json"
     if t_cache.exists():
@@ -394,23 +413,43 @@ def get_timings(vocals: Path, file_hash: str, pre_timed: Optional[list[dict]], p
         try:
             import whisperx
             print(f"⚙️ WhisperX alignment ({g.info()})…")
-            audio = whisperx.load_audio(str(vocals))
-            wmodel = whisperx.load_model(
-                "large-v3", g.torch_device,
-                compute_type=g.compute_type,
-                language=lang,
-            )
 
-            # ШАГ A: транскрипция по реальному аудио → правильные тайминги сегментов
-            # vad_options убраны — в новых версиях WhisperX этот параметр не поддерживается
+            def _try_load_model(device, compute_type):
+                return whisperx.load_model(
+                    "large-v3", device,
+                    compute_type=compute_type,
+                    language=lang,
+                )
+
+            # Пробуем на GPU, при ошибке CUDA-драйвера падаем на CPU
+            try:
+                audio  = whisperx.load_audio(str(vocals))
+                wmodel = _try_load_model(g.torch_device, g.compute_type)
+            except RuntimeError as e:
+                if "CUDA" in str(e) or "driver" in str(e).lower():
+                    print(f"⚠️  CUDA недоступна ({e!s:.120})")
+                    print("   → Переключаемся на CPU (медленнее, но надёжно)")
+                    g = _cpu_fallback_gpu()
+                    audio  = whisperx.load_audio(str(vocals))
+                    wmodel = _try_load_model("cpu", "int8")
+                else:
+                    raise
+
             result = wmodel.transcribe(
                 audio,
                 batch_size=4 if g.backend == "cpu" else 16,
             )
 
-            # ШАГ B: word-level alignment НА ТРАНСКРИПЦИИ (не на lyrics!)
-            # wav2vec2 выравнивает то, что реально звучит → точные тайминги без дрейфа
-            amodel, meta = whisperx.load_align_model(language_code=lang, device=g.torch_device)
+            # word-level alignment
+            try:
+                amodel, meta = whisperx.load_align_model(language_code=lang, device=g.torch_device)
+            except RuntimeError as e:
+                if "CUDA" in str(e) or "driver" in str(e).lower():
+                    print("⚠️  CUDA недоступна для align_model → CPU")
+                    amodel, meta = whisperx.load_align_model(language_code=lang, device="cpu")
+                else:
+                    raise
+
             aligned = whisperx.align(
                 result["segments"], amodel, meta,
                 audio, g.torch_device,
@@ -427,8 +466,7 @@ def get_timings(vocals: Path, file_hash: str, pre_timed: Optional[list[dict]], p
                             "end":   float(w.get("end",   0)),
                         })
 
-            # ШАГ C: ПОСЛЕ получения таймингов — заменяем слова на канонический текст
-            # Тайминги остаются от реального аудио → рассинхрона нет
+            # Заменяем слова на канонический текст из lyrics
             if plain_lyrics and aligned_words:
                 lyrics_words = [lw for line in plain_lyrics.splitlines()
                                 for lw in line.split() if lw]
@@ -443,14 +481,12 @@ def get_timings(vocals: Path, file_hash: str, pre_timed: Optional[list[dict]], p
                     result_words: list[dict] = []
                     for op, a0, a1, b0, b1 in sm.get_opcodes():
                         if op == "equal":
-                            # Слова совпали → тайминг из alignment, текст из lyrics
                             for i in range(a1 - a0):
                                 result_words.append({
                                     **aligned_words[a0 + i],
                                     "word": lyrics_words[b0 + i],
                                 })
                         elif op == "replace":
-                            # Разное кол-во → равномерно растягиваем тайминги
                             t_s = aligned_words[a0]["start"]
                             t_e = aligned_words[min(a1-1, len(aligned_words)-1)]["end"]
                             n   = b1 - b0
@@ -462,12 +498,10 @@ def get_timings(vocals: Path, file_hash: str, pre_timed: Optional[list[dict]], p
                                     "end":   t_s + (j + 1) * dur,
                                 })
                         elif op == "insert":
-                            # Слово есть в lyrics, но Whisper не услышал (тихо/быстро)
                             ref_t = aligned_words[min(a0, len(aligned_words)-1)]["end"]
                             for j, lw in enumerate(lyrics_words[b0:b1]):
                                 ts = ref_t + j * 0.2
                                 result_words.append({"word": lw, "start": ts, "end": ts + 0.2})
-                        # op == "delete": Whisper слышал лишнее (эдлиб) — пропускаем
                     words = result_words if result_words else aligned_words
                 else:
                     words = aligned_words
@@ -477,15 +511,30 @@ def get_timings(vocals: Path, file_hash: str, pre_timed: Optional[list[dict]], p
             print(f"   ✓ выровнено {len(words)} слов")
         except ImportError:
             print("   WhisperX не найден → Whisper STT")
+        except RuntimeError as e:
+            print(f"⚠️  WhisperX RuntimeError: {e!s:.200}")
+            print("   → Падаем на Whisper STT на CPU")
+            words = []  # триггерим CPU-Whisper ниже
 
     if not words:
         import whisper
-        print(f"🗣 Whisper STT ({model_name}, {g.info()})…")
-        model = whisper.load_model(model_name, device=g.torch_device)
+        # Пробуем GPU, при CUDA-ошибке — CPU
+        device = g.torch_device
+        print(f"🗣 Whisper STT ({model_name}, device={device})…")
+        try:
+            model = whisper.load_model(model_name, device=device)
+        except RuntimeError as e:
+            if "CUDA" in str(e) or "driver" in str(e).lower():
+                print(f"⚠️  CUDA недоступна → Whisper на CPU")
+                device = "cpu"
+                model = whisper.load_model(model_name, device="cpu")
+            else:
+                raise
         result = model.transcribe(str(vocals), word_timestamps=True, language=lang)
         for seg in result["segments"]:
             for w in seg.get("words", []):
-                if t := w["word"].strip(): words.append({"word": t, "start": float(w["start"]), "end": float(w["end"])})
+                if t := w["word"].strip():
+                    words.append({"word": t, "start": float(w["start"]), "end": float(w["end"])})
         words = phonetic_slang(apply_slang(words))
 
     with open(t_cache, "w", encoding="utf-8") as f: json.dump(words, f, ensure_ascii=False)

@@ -285,15 +285,24 @@ class MicEngine:
 # ══════════════════════════════════════════════════════════════════════════════
 class Scorer:
     """
-    Сравнивает огибающую RMS микрофона с огибающей оригинального вокала.
-    Оценка = Pearson-корреляция энергетических паттернов → 0..100.
-    Не требует pitch-detection, работает на основе ритмических пиков.
+    Оценивает пение по двум компонентам:
+    1. Ритм (40%): Pearson-корреляция энергетических огибающих mic vs вокал.
+       Улавливает совпадение динамики/пульсации.
+    2. Покрытие (60%): доля слов, во время которых mic активен (RMS > порог).
+       Улавливает «пел ли вообще» в нужные моменты.
+
+    Итоговый балл = 0.4×ритм + 0.6×покрытие, отображается 0..100.
     """
-    ENV_SR = 100  # точек огибающей в секунду
+    ENV_SR   = 100   # точек огибающей в секунду
+    MIC_THRES = 0.01  # порог RMS «поёт / не поёт»
 
     def __init__(self):
         self.vocal_env: Optional[np.ndarray] = None
-        self._scores: list[float] = []
+        self._rhythm_scores:   list[float] = []
+        self._coverage_scores: list[float] = []
+        self._word_hits:  int = 0
+        self._word_total: int = 0
+        self._words: list = []   # список слов для coverage
 
     def load_vocal(self, path: Path):
         try:
@@ -309,25 +318,62 @@ class Scorer:
         except Exception as e:
             print(f"Scorer: {e}"); self.vocal_env = None
 
+    def set_words(self, words: list):
+        """Передаём список слов с таймингами для покрытия."""
+        self._words = words
+
+    def score_tick(self, mic_rms_window: np.ndarray, pos: float) -> tuple[float, float]:
+        """Возвращает (ритм 0-100, покрытие 0-100)."""
+        # --- Ритм ---
+        rhythm = 0.0
+        if self.vocal_env is not None and len(mic_rms_window) >= 5:
+            c  = int(pos * self.ENV_SR)
+            h  = len(mic_rms_window) // 2
+            v  = self.vocal_env[max(0, c-h): min(len(self.vocal_env), c+h)]
+            n  = min(len(mic_rms_window), len(v))
+            if n >= 5:
+                m, vv = mic_rms_window[:n], v[:n]
+                m  = m  / (m.max()  + 1e-9)
+                vv = vv / (vv.max() + 1e-9)
+                if np.std(m) > 1e-6 and np.std(vv) > 1e-6:
+                    rhythm = max(0.0, float(np.corrcoef(m, vv)[0,1])) * 100.0
+        self._rhythm_scores.append(rhythm)
+
+        # --- Покрытие: проверяем слова вокруг текущей позиции ---
+        cov = 0.0
+        if self._words:
+            window_words = [w for w in self._words
+                            if w["start"] <= pos <= w.get("end", pos+0.1)]
+            if window_words:
+                active = float(np.mean(mic_rms_window[-10:])) > self.MIC_THRES if len(mic_rms_window) >= 10 else False
+                self._word_total += len(window_words)
+                if active: self._word_hits += len(window_words)
+            cov = (self._word_hits / max(1, self._word_total)) * 100.0
+        self._coverage_scores.append(cov)
+        return rhythm, cov
+
+    # Kept for backwards compat (ProcessingThread uses old .score())
     def score(self, mic_rms: np.ndarray, pos: float) -> float:
-        if self.vocal_env is None or len(mic_rms) < 5: return 0.0
-        c  = int(pos * self.ENV_SR)
-        h  = len(mic_rms) // 2
-        v  = self.vocal_env[max(0,c-h) : min(len(self.vocal_env), c+h)]
-        n  = min(len(mic_rms), len(v))
-        if n < 5: return 0.0
-        m, v = mic_rms[:n], v[:n]
-        m = m / (m.max()+1e-9); v = v / (v.max()+1e-9)
-        if np.std(m) < 1e-6 or np.std(v) < 1e-6: return 0.0
-        s = max(0.0, float(np.corrcoef(m, v)[0,1])) * 100.0
-        self._scores.append(s)
-        return s
+        r, c = self.score_tick(mic_rms, pos)
+        return r * 0.4 + c * 0.6
 
     @property
     def session(self) -> float:
-        return float(np.mean(self._scores)) if self._scores else 0.0
+        r = float(np.mean(self._rhythm_scores))  if self._rhythm_scores  else 0.0
+        c = float(np.mean(self._coverage_scores)) if self._coverage_scores else 0.0
+        return r * 0.4 + c * 0.6
 
-    def reset(self): self._scores.clear()
+    @property
+    def rhythm_avg(self) -> float:
+        return float(np.mean(self._rhythm_scores)) if self._rhythm_scores else 0.0
+
+    @property
+    def coverage_avg(self) -> float:
+        return float(np.mean(self._coverage_scores)) if self._coverage_scores else 0.0
+
+    def reset(self):
+        self._rhythm_scores.clear(); self._coverage_scores.clear()
+        self._word_hits = 0; self._word_total = 0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -530,25 +576,66 @@ class ProcessingThread(QThread):
             self.error.emit(f"{e}\n{traceback.format_exc()[-600:]}")
 
 
+class SearchThread(QThread):
+    """Ищет несколько вариантов на YT без скачивания."""
+    results  = pyqtSignal(list)   # list of dicts
+    error    = pyqtSignal(str)
+
+    def __init__(self, query: str):
+        super().__init__()
+        self.query = query
+
+    def run(self):
+        try:
+            r = subprocess.run(
+                ["yt-dlp", f"ytsearch8:{self.query}",
+                 "--flat-playlist", "--dump-json", "--no-playlist"],
+                capture_output=True, text=True, timeout=30)
+            if r.returncode != 0:
+                self.error.emit(r.stderr[-200:]); return
+            items = []
+            for line in r.stdout.strip().splitlines():
+                try:
+                    d = json.loads(line)
+                    dur = d.get("duration") or 0
+                    mins, secs = divmod(int(dur), 60)
+                    items.append({
+                        "id":      d.get("id",""),
+                        "url":     d.get("url") or f"https://www.youtube.com/watch?v={d.get('id','')}",
+                        "title":   d.get("title","?"),
+                        "channel": d.get("channel") or d.get("uploader",""),
+                        "duration":f"{mins}:{secs:02d}",
+                        "views":   d.get("view_count", 0),
+                    })
+                except: pass
+            self.results.emit(items)
+        except FileNotFoundError:
+            self.error.emit("yt-dlp не установлен:\npip install yt-dlp")
+        except Exception as e:
+            self.error.emit(str(e))
+
+
 class DownloadThread(QThread):
     progress = pyqtSignal(str)
     finished = pyqtSignal(str)
     error    = pyqtSignal(str)
 
-    def __init__(self, query:str, out_dir:str):
+    def __init__(self, url_or_query: str, out_dir: str, is_url: bool = False):
         super().__init__()
-        self.query   = query
-        self.out_dir = out_dir
+        self.url_or_query = url_or_query
+        self.out_dir      = out_dir
+        self.is_url       = is_url
 
     def run(self):
         try:
-            self.progress.emit(f"⬇️  Ищем: {self.query}…")
+            target = self.url_or_query if self.is_url else f"ytsearch1:{self.url_or_query}"
+            self.progress.emit(f"⬇️  Скачиваем…")
             tmpl = str(Path(self.out_dir) / "%(artist)s - %(title)s.%(ext)s")
             r = subprocess.run(
-                ["yt-dlp", f"ytsearch1:{self.query}",
+                ["yt-dlp", target,
                  "-x","--audio-format","mp3","--audio-quality","0",
                  "-o", tmpl, "--print","after_move:filepath","--no-playlist"],
-                capture_output=True, text=True, timeout=180)
+                capture_output=True, text=True, timeout=300)
             if r.returncode != 0:
                 self.error.emit(r.stderr[-300:]); return
             filepath = (r.stdout.strip().splitlines() or [""])[-1]
@@ -702,45 +789,117 @@ class ProcessingDialog(QDialog):
 
 
 class DownloadDialog(QDialog):
+    """
+    Диалог скачивания: сначала ищет 8 вариантов на YT, показывает
+    список (название, канал, длительность), потом скачивает выбранный.
+    """
     track_ready = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("⬇️  Скачать трек")
-        self.setMinimumSize(520, 240)
+        self.setWindowTitle("⬇️  Найти и скачать трек")
+        self.setMinimumSize(680, 480)
+        self._out      = str(DOWNLOADS_DIR)
+        self._results  = []
         self._build()
 
     def _build(self):
         lay = QVBoxLayout(self)
-        lay.addWidget(QLabel("Поиск трека на YouTube (yt-dlp):"))
+
+        # Search bar
+        top = QHBoxLayout()
         self.inp = QLineEdit()
-        self.inp.setPlaceholderText("Платина — Мало помалу  /  Pharaoh 5 минут назад…")
-        self.inp.returnPressed.connect(self._go)
-        lay.addWidget(self.inp)
-        self.status = QLabel(""); self.status.setWordWrap(True)
+        self.inp.setPlaceholderText("Платина — Санта Клаус  /  PHARAOH Дико, например…")
+        self.inp.returnPressed.connect(self._search)
+        top.addWidget(self.inp)
+        self.search_btn = QPushButton("🔍 Найти")
+        self.search_btn.setFixedWidth(90)
+        self.search_btn.clicked.connect(self._search)
+        top.addWidget(self.search_btn)
+        lay.addLayout(top)
+
+        # Status + bar
+        self.status = QLabel("Введи запрос и нажми «Найти»")
+        self.status.setStyleSheet("color:#888; font-size:12px;")
         lay.addWidget(self.status)
         self.bar = QProgressBar(); self.bar.setRange(0,0); self.bar.hide()
         lay.addWidget(self.bar)
-        row = QHBoxLayout()
-        dl = QPushButton("⬇️  Скачать"); dl.clicked.connect(self._go)
-        cl = QPushButton("Закрыть");     cl.clicked.connect(self.close)
-        row.addWidget(dl); row.addWidget(cl)
-        lay.addLayout(row)
-        self._out = str(DOWNLOADS_DIR)
 
-    def _go(self):
+        # Results list
+        lbl = QLabel("Результаты (выбери нужный вариант):")
+        lay.addWidget(lbl)
+        self.lst = QListWidget()
+        self.lst.setAlternatingRowColors(True)
+        self.lst.setStyleSheet(
+            "QListWidget { alternate-background-color: #12122a; }"
+            "QListWidget::item { padding: 6px 10px; border-bottom: 1px solid #1e1e38; }"
+        )
+        self.lst.itemDoubleClicked.connect(self._download_selected)
+        lay.addWidget(self.lst)
+
+        # Buttons
+        row = QHBoxLayout()
+        self.dl_btn = QPushButton("⬇️  Скачать выбранный")
+        self.dl_btn.setEnabled(False)
+        self.dl_btn.clicked.connect(self._download_selected)
+        cl = QPushButton("Закрыть")
+        cl.clicked.connect(self.close)
+        row.addWidget(self.dl_btn); row.addWidget(cl)
+        lay.addLayout(row)
+
+    def _search(self):
         q = self.inp.text().strip()
         if not q: return
+        self.lst.clear(); self._results = []
+        self.dl_btn.setEnabled(False)
         self.bar.show()
-        self._t = DownloadThread(q, self._out)
-        self._t.progress.connect(self.status.setText)
-        self._t.finished.connect(self._on_done)
-        self._t.error.connect(lambda e: (self.bar.hide(), self.status.setText(f"❌ {e[:200]}")))
-        self._t.start()
+        self.status.setText(f"🔍 Ищем «{q}» на YouTube…")
+        self._st = SearchThread(q)
+        self._st.results.connect(self._on_results)
+        self._st.error.connect(lambda e: (self.bar.hide(), self.status.setText(f"❌ {e[:200]}")))
+        self._st.start()
 
-    def _on_done(self, path:str):
+    def _on_results(self, items: list):
         self.bar.hide()
-        self.status.setText(f"✅ {Path(path).name}")
+        self._results = items
+        self.lst.clear()
+        if not items:
+            self.status.setText("Ничего не найдено, попробуй другой запрос")
+            return
+        self.status.setText(f"Найдено вариантов: {len(items)}. Двойной клик или «Скачать».")
+        for it in items:
+            views = f"{it['views']//1000}K" if it['views'] > 1000 else str(it['views'])
+            self.lst.addItem(
+                f"🎵  {it['title']}\n"
+                f"    📺 {it['channel']}  ⏱ {it['duration']}  👁 {views}"
+            )
+        self.lst.setCurrentRow(0)
+        self.dl_btn.setEnabled(True)
+
+    def _download_selected(self):
+        row = self.lst.currentRow()
+        if row < 0 or row >= len(self._results): return
+        it = self._results[row]
+        self.dl_btn.setEnabled(False)
+        self.search_btn.setEnabled(False)
+        self.bar.show()
+        self.status.setText(f"⬇️ Скачиваем: {it['title'][:60]}…")
+        self._dt = DownloadThread(it["url"], self._out, is_url=True)
+        self._dt.progress.connect(self.status.setText)
+        self._dt.finished.connect(self._on_done)
+        self._dt.error.connect(lambda e: (
+            self.bar.hide(),
+            self.status.setText(f"❌ {e[:200]}"),
+            self.dl_btn.setEnabled(True),
+            self.search_btn.setEnabled(True),
+        ))
+        self._dt.start()
+
+    def _on_done(self, path: str):
+        self.bar.hide()
+        self.status.setText(f"✅ Скачано: {Path(path).name}")
+        self.dl_btn.setEnabled(True)
+        self.search_btn.setEnabled(True)
         self.track_ready.emit(path)
 
 
@@ -837,6 +996,7 @@ class KaraokeWindow(QWidget):
         if AUDIO_OK:
             self.audio.load(Path(data["vocals"]), self.inst_path)
             self.scorer.load_vocal(Path(data["vocals"]))
+            self.scorer.set_words(self.words)
 
         self._load_env(self.inst_path)
         self.scorer.reset()
@@ -847,6 +1007,12 @@ class KaraokeWindow(QWidget):
         self._paused     = False
         self._fallback_proc = None
         self._fallback_start_time = 0
+        self._sync_offset = 0.0  # будет обновлён слайдером
+
+        # Line-transition smoothing
+        self._prev_li   = -1
+        self._trans_t   = 0.0   # время начала перехода (секунды реального времени)
+        self._TRANS_DUR = 0.18  # длительность fade-перехода строк (сек)
 
         self._build_ui()
         self._timer = QTimer(self)
@@ -857,6 +1023,7 @@ class KaraokeWindow(QWidget):
     def _load_env(self, path:Path, sr_env:int=100):
         self._env: Optional[np.ndarray] = None
         self._env_sr = sr_env
+        self._pulse_env: Optional[np.ndarray] = None  # сглаженный удар для пульса фона
         if not AUDIO_OK: return
         try:
             data, sr = sf.read(str(path), dtype="float32")
@@ -867,6 +1034,15 @@ class KaraokeWindow(QWidget):
             m = env.max()
             if m > 0: env /= m
             self._env = env
+
+            # Pulse env: более медленное сглаживание (окно ~0.4 сек) для плавной пульсации фона
+            from numpy.lib.stride_tricks import sliding_window_view
+            w = max(1, int(sr_env * 0.4))
+            padded = np.pad(env, (w//2, w//2), mode='edge')
+            smooth = np.array([padded[i:i+w].max() for i in range(len(env))], dtype=np.float32)
+            sm = smooth.max()
+            if sm > 0: smooth /= sm
+            self._pulse_env = smooth
         except Exception as e: print(f"Env: {e}")
 
     # ── UI ────────────────────────────────────────────────────────────────────
@@ -935,9 +1111,19 @@ class KaraokeWindow(QWidget):
         self.sl_voc.valueChanged.connect(lambda v: setattr(self.audio,'vol_voc',v/100))
         vl2.addWidget(self.sl_voc); hl.addLayout(vl2)
 
-        hl.addSpacing(10)
+        # Sync offset
+        vl3 = QVBoxLayout(); vl3.setSpacing(2)
+        vl3.addWidget(QLabel("⏱ Синхр."))
+        self.sl_sync = QSlider(Qt.Orientation.Horizontal)
+        self.sl_sync.setRange(-150, 150)   # -1.5s .. +1.5s  (×10ms)
+        self.sl_sync.setValue(0)
+        self.sl_sync.setFixedWidth(110)
+        self.sl_sync.setToolTip("Сдвиг текста ±1.5 с если текст опережает/отстаёт от музыки")
+        self._sync_offset = 0.0
+        self.sl_sync.valueChanged.connect(lambda v: setattr(self,'_sync_offset', v/100.0))
+        vl3.addWidget(self.sl_sync); hl.addLayout(vl3)
 
-        # Mic toggle
+        hl.addSpacing(10)
         self.mic_btn = QPushButton("🎙 Mic")
         self.mic_btn.setCheckable(True); self.mic_btn.setFixedSize(70,46)
         self.mic_btn.toggled.connect(self._toggle_mic)
@@ -953,10 +1139,15 @@ class KaraokeWindow(QWidget):
 
         hl.addStretch()
 
-        # Score
+        # Score display
+        score_col = QVBoxLayout(); score_col.setSpacing(0)
         self.score_lbl = QLabel("—")
         self.score_lbl.setStyleSheet("font-size:26px; font-weight:bold; color:#ffdc28;")
-        hl.addWidget(self.score_lbl)
+        self.score_sub = QLabel("")
+        self.score_sub.setStyleSheet("font-size:10px; color:#888;")
+        score_col.addWidget(self.score_lbl)
+        score_col.addWidget(self.score_sub)
+        hl.addLayout(score_col)
         hl.addWidget(QLabel("pts"))
 
         # Disable controls if audio is not OK
@@ -1010,6 +1201,35 @@ class KaraokeWindow(QWidget):
         self.closed.emit(self.scorer.session)
         self.close()
 
+    def closeEvent(self, e):
+        # Вызывается при любом закрытии окна (крестик, Alt+F4, Escape)
+        # Останавливаем всё чтобы аудио не висело в фоне
+        self._timer.stop()
+        if AUDIO_OK:
+            self.audio.stop()
+        if self._fallback_proc:
+            self._fallback_proc.kill()
+            self._fallback_proc = None
+        self.mic.stop()
+        # Emit score только если ещё не было — _stop() тоже emit'ит
+        if not getattr(self, '_stopped', False):
+            self._stopped = True
+            self.closed.emit(self.scorer.session)
+        super().closeEvent(e)
+
+    def _stop(self):
+        if getattr(self, '_stopped', False):
+            return  # уже остановлено через closeEvent
+        self._stopped = True
+        if AUDIO_OK:
+            self.audio.stop()
+        if self._fallback_proc:
+            self._fallback_proc.kill()
+            self._fallback_proc = None
+        self.mic.stop(); self._timer.stop()
+        self.closed.emit(self.scorer.session)
+        self.close()
+
     def _toggle_mic(self, on:bool):
         if on: self.mic.start(); self.mic_btn.setText("🎙 ON")
         else:  self.mic.stop();  self.mic_btn.setText("🎙 Mic")
@@ -1046,8 +1266,14 @@ class KaraokeWindow(QWidget):
         self._score_tick += 1
         if self._score_tick >= 60 and self.mic.active:
             self._score_tick = 0
-            s = self.scorer.score(self.mic.rms_window(), pos)
-            self.score_lbl.setText(f"{self.scorer.session:.0f}")
+            rms_win = self.mic.rms_window()
+            self.scorer.score_tick(rms_win, pos)
+            total = self.scorer.session
+            self.score_lbl.setText(f"{total:.0f}")
+            self.score_sub.setText(
+                f"ритм {self.scorer.rhythm_avg:.0f}  "
+                f"покр {self.scorer.coverage_avg:.0f}"
+            )
 
         self.update()  # trigger paintEvent
 
@@ -1065,31 +1291,60 @@ class KaraokeWindow(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         W, H = self.width(), self.height()
-        pos = self.audio.position
+        # Apply sync offset to position used for lyrics
+        pos = self.audio.position + self._sync_offset
         ctrl_h = 88
         draw_h  = H - ctrl_h - 4  # height of draw area
 
-        # 1. Background gradient
-        grad = QLinearGradient(0,0,0,H)
-        grad.setColorAt(0, QColor(8,8,18))
-        grad.setColorAt(1, QColor(18,8,28))
-        painter.fillRect(0,0,W,H, QBrush(grad))
+        # 1. Получаем текущий пульс из огибающей инструментала
+        pulse = 0.0
+        if self._pulse_env is not None:
+            idx = max(0, min(int(self.audio.position * self._env_sr), len(self._pulse_env)-1))
+            pulse = float(self._pulse_env[idx])
 
-        # 2. Scanlines
-        pen = QPen(QColor(0,0,0,15)); pen.setWidth(1); painter.setPen(pen)
-        for y in range(0, draw_h, 4): painter.drawLine(0,y,W,y)
+        # 2. Чистый тёмный фон — один цвет, никаких градиентов поверх
+        bg_r = int(8  + pulse * 6)
+        bg_g = int(8  + pulse * 4)
+        bg_b = int(18 + pulse * 10)
+        painter.fillRect(0, 0, W, H, QColor(bg_r, bg_g, bg_b))
 
-        # 3. Waveform background from instrumental envelope
+        # 3. Виньетка по краям (только края темнее, центр чистый)
+        vig = QLinearGradient(0, 0, 0, draw_h)
+        vig.setColorAt(0,   QColor(0, 0, 0, 80))
+        vig.setColorAt(0.2, QColor(0, 0, 0, 0))
+        vig.setColorAt(0.8, QColor(0, 0, 0, 0))
+        vig.setColorAt(1,   QColor(0, 0, 0, 80))
+        painter.fillRect(0, 0, W, draw_h, QBrush(vig))
+        # Боковая виньетка
+        vig_h = QLinearGradient(0, 0, W, 0)
+        vig_h.setColorAt(0,   QColor(0, 0, 0, 60))
+        vig_h.setColorAt(0.15, QColor(0, 0, 0, 0))
+        vig_h.setColorAt(0.85, QColor(0, 0, 0, 0))
+        vig_h.setColorAt(1,   QColor(0, 0, 0, 60))
+        painter.fillRect(0, 0, W, draw_h, QBrush(vig_h))
+
+        # 4. Тонкая цветная полоска снизу — индикатор бита (не мешает тексту)
+        beat_h = max(2, int(pulse * 5))
+        beat_a = int(pulse * 180)
+        if beat_a > 10:
+            beat_grad = QLinearGradient(0, 0, W, 0)
+            beat_grad.setColorAt(0,   QColor(80, 40, 200, 0))
+            beat_grad.setColorAt(0.3, QColor(120, 60, 255, beat_a))
+            beat_grad.setColorAt(0.5, QColor(160, 80, 255, beat_a))
+            beat_grad.setColorAt(0.7, QColor(120, 60, 255, beat_a))
+            beat_grad.setColorAt(1,   QColor(80, 40, 200, 0))
+            painter.fillRect(0, draw_h - beat_h - 4, W, beat_h, QBrush(beat_grad))
+
+        # 5. Опциональная осциллограмма (только если включено кнопкой)
         if self._show_wave and self._env is not None and len(self._env)>1:
             win_sec = 12.0
-            c   = int(pos * self._env_sr)
+            c   = int(self.audio.position * self._env_sr)
             half= int(win_sec * self._env_sr / 2)
             seg = self._env[max(0,c-half):min(len(self._env),c+half)]
             if len(seg) > 1:
                 mid = draw_h // 2
-                amp = draw_h * 0.22
+                amp = draw_h * 0.14
                 n   = len(seg)
-                # Glow path (wide, transparent)
                 def make_path(upper:bool):
                     p = QPainterPath()
                     for i,v in enumerate(seg):
@@ -1099,14 +1354,9 @@ class KaraokeWindow(QWidget):
                         else:    p.lineTo(x,y)
                     return p
                 pt = make_path(True); pb = make_path(False)
-
-                for (path, alpha) in [(pt,35),(pb,35)]:
-                    pen = QPen(QColor(90,130,255,alpha)); pen.setWidth(2)
+                for path in (pt, pb):
+                    pen = QPen(QColor(90,130,255,28)); pen.setWidth(2)
                     painter.setPen(pen); painter.drawPath(path)
-                # Brighter top edge
-                pen2 = QPen(QColor(140,170,255,70)); pen2.setWidth(1)
-                painter.setPen(pen2)
-                painter.drawPath(pt); painter.drawPath(pb)
 
         # 4. Lyrics
         self._paint_lyrics(painter, W, draw_h, pos)
@@ -1131,25 +1381,43 @@ class KaraokeWindow(QWidget):
 
     def _paint_lyrics(self, painter:QPainter, W:int, H:int, pos:float):
         if not self.lines: return
-        # Find current position
+
+        # Find current line/word
         li, wi = 0, -1
         for l_i, line in enumerate(self.lines):
             for w_i, w in enumerate(line):
-                if w["start"] <= pos: li, wi = l_i, w_i
+                if w["start"] <= pos:
+                    li, wi = l_i, w_i
+
+        # Track line transitions for fade effect
+        now_real = time.monotonic()
+        if li != self._prev_li and self._prev_li >= 0:
+            self._trans_t = now_real
+        self._prev_li = li
+
+        # trans_alpha: 0.0 = just changed (old fading out/new fading in), 1.0 = stable
+        elapsed = now_real - self._trans_t
+        trans_alpha = min(1.0, elapsed / max(self._TRANS_DUR, 0.001))
 
         cy = H // 2 - 16
 
-        def draw_line(idx:int, y:int, main:bool):
+        def word_alpha(is_main_line: bool, opacity: float = 1.0) -> int:
+            """Возвращает alpha с учётом перехода строк."""
+            if is_main_line:
+                # Новая активная строка: плавно появляется
+                a = int(255 * min(1.0, trans_alpha * 2))
+            else:
+                a = int(255 * opacity)
+            return max(0, min(255, a))
+
+        def draw_line(idx:int, y:int, main:bool, opacity:float=1.0):
             if idx < 0 or idx >= len(self.lines): return
             line = self.lines[idx]
-            
-            # --- ИНТЕГРАЦИЯ ВАШЕЙ ЛОГИКИ ---
-            # 1. Определяем шрифты для обычных слов и эдлибов
+
             main_font_size = 30 if main else 18
-            main_font = QFont("DejaVu Sans", main_font_size, QFont.Weight.Bold)
+            main_font  = QFont("DejaVu Sans", main_font_size, QFont.Weight.Bold)
             adlib_font = QFont("DejaVu Sans", int(main_font_size * 0.7), QFont.Weight.Normal)
 
-            # 2. Предварительно вычисляем общую ширину строки с учетом разных шрифтов
             total_w = 0
             word_parts = []
             for w in line:
@@ -1158,47 +1426,66 @@ class KaraokeWindow(QWidget):
                 font = adlib_font if is_adlib else main_font
                 fm = QFontMetrics(font)
                 adv = fm.horizontalAdvance(text)
-                word_parts.append({'text': text, 'is_adlib': is_adlib, 'font': font, 'adv': adv, 'start': w['start'], 'end': w['end']})
+                word_parts.append({
+                    'text': text, 'is_adlib': is_adlib, 'font': font,
+                    'adv': adv, 'start': w['start'], 'end': w['end']
+                })
                 total_w += adv
 
             x = (W - total_w) // 2
+            base_alpha = word_alpha(main, opacity)
+
             for i, part in enumerate(word_parts):
                 painter.setFont(part['font'])
-                
-                # Drop shadow for readability
-                painter.setPen(QPen(QColor(0,0,0,120)))
+
+                # Drop shadow
+                shad = QColor(0,0,0,int(base_alpha * 0.47))
+                painter.setPen(QPen(shad))
                 painter.drawText(x+2, y+2, part['text'])
-                
-                # 3. Умный рендер слов с плавной заливкой для текущей строки
+
                 if main:
                     if i < wi:
-                        painter.setPen(QPen(QColor(100, 100, 140)))  # Уже спели
+                        c = QColor(100, 100, 140, base_alpha)
+                        painter.setPen(QPen(c))
                         painter.drawText(x, y, part['text'])
                     elif i == wi:
-                        # ТЕКУЩЕЕ СЛОВО: Отрисовываем основу (тускло-жёлтый)
-                        painter.setPen(QPen(QColor(140, 120, 20)))
+                        # Base (dim)
+                        painter.setPen(QPen(QColor(140, 120, 20, base_alpha)))
                         painter.drawText(x, y, part['text'])
-                        
-                        # Считаем прогресс (от 0.0 до 1.0) внутри слова
+                        # Filled part (bright yellow)
                         pct = max(0.0, min(1.0, (pos - part['start']) / max(0.001, part['end'] - part['start'])))
                         fill_w = int(part['adv'] * pct)
-                        
-                        # Рисуем поверх ярким цветом, обрезая кисть (Clipping)
                         if fill_w > 0:
                             painter.save()
                             clip_y = y - QFontMetrics(part['font']).ascent() - 5
                             clip_h = QFontMetrics(part['font']).height() + 10
                             painter.setClipRect(QRect(x, clip_y, fill_w, clip_h))
-                            painter.setPen(QPen(QColor(255, 220, 40)))  # Яркий жёлтый
+                            painter.setPen(QPen(QColor(255, 220, 40, base_alpha)))
                             painter.drawText(x, y, part['text'])
                             painter.restore()
                     else:
-                        color = QColor("#aaaaaa") if part['is_adlib'] else QColor(210, 210, 240)
-                        painter.setPen(QPen(color))
+                        # Upcoming words: slightly pre-highlight next word
+                        if i == wi + 1:
+                            # Next word gets a subtle pre-glow so you can read ahead
+                            time_to_next = part['start'] - pos
+                            pre = max(0.0, min(1.0, 1.0 - time_to_next / 0.5))  # 0.5s lookahead
+                            if pre > 0:
+                                c = QColor(
+                                    int(210 + pre * 45),
+                                    int(210 + pre * 10),
+                                    int(240 - pre * 100),
+                                    base_alpha
+                                )
+                            else:
+                                c = QColor(210, 210, 240, base_alpha)
+                        else:
+                            c = QColor(120,120,150,base_alpha) if part['is_adlib'] else QColor(210,210,240,base_alpha)
+                        painter.setPen(QPen(c))
                         painter.drawText(x, y, part['text'])
                 else:
-                    # Не активная строка (прошлые или будущие)
-                    color = QColor(120, 120, 160) if idx < li else (QColor("#aaaaaa") if part['is_adlib'] else QColor(150, 150, 190))
+                    color = QColor(120,120,160,base_alpha) if idx < li else (
+                        QColor(170,170,170,base_alpha) if part['is_adlib'] else QColor(150,150,190,base_alpha)
+                    )
                     painter.setPen(QPen(color))
                     painter.drawText(x, y, part['text'])
 
@@ -1206,10 +1493,12 @@ class KaraokeWindow(QWidget):
 
         main_h = 44; sub_h = 28
 
-        draw_line(li-1, cy - sub_h - 6,  False)
+        # Previous line fades out during transition
+        prev_opacity = 1.0 - trans_alpha if elapsed < self._TRANS_DUR else 1.0
+        draw_line(li-1, cy - sub_h - 6,  False, prev_opacity)
         draw_line(li,   cy,               True)
         draw_line(li+1, cy + main_h + 4,  False)
-        draw_line(li+2, cy + main_h + sub_h + 8, False)
+        draw_line(li+2, cy + main_h + sub_h + 8, False, 0.6)
 
     # ── keys ─────────────────────────────────────────────────────────────────
     def keyPressEvent(self, e:QKeyEvent):
@@ -1646,7 +1935,7 @@ class MainWindow(QMainWindow):
         return bi if best >= max(1,len(q_words)//2) else None
 
     def _auto_dl(self, query:str):
-        self._dl_thread = DownloadThread(query, str(DOWNLOADS_DIR))
+        self._dl_thread = DownloadThread(query, str(DOWNLOADS_DIR), is_url=False)
         self._dl_thread.progress.connect(self.statusBar().showMessage)
         self._dl_thread.finished.connect(self._on_auto_dl)
         self._dl_thread.error.connect(lambda e: self.statusBar().showMessage(f"❌ {e[:80]}"))

@@ -146,69 +146,113 @@ CUDA_VERSIONS = {
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+ROCM_PYTHON_HINT = """
+╔══════════════════════════════════════════════════════════════╗
+║  AMD ROCm — важные замечания                                  ║
+╠══════════════════════════════════════════════════════════════╣
+║  torch для ROCm собран только под Python 3.10 / 3.11.        ║
+║  Если у тебя Python 3.12+ — скрипт может упасть на pip.      ║
+║                                                              ║
+║  Arch Linux: python310 / python311 из AUR                    ║
+║    yay -S python310                                          ║
+║    python3.10 -m venv .venv && source .venv/bin/activate     ║
+║    python3.10 install.py                                     ║
+║                                                              ║
+║  Ubuntu 22.04 / 24.04 (deadsnakes PPA):                     ║
+║    sudo add-apt-repository ppa:deadsnakes/ppa                ║
+║    sudo apt install python3.11 python3.11-venv               ║
+║    python3.11 -m venv .venv && source .venv/bin/activate     ║
+║    python3.11 install.py                                     ║
+║                                                              ║
+║  ROCm системные пакеты (если ещё не установлены):            ║
+║    Arch:   sudo pacman -S rocm-opencl-runtime hip-runtime-amd ║
+║    Ubuntu: sudo apt install rocm-dev                         ║
+║    Docs:   https://rocm.docs.amd.com/                        ║
+╚══════════════════════════════════════════════════════════════╝
+"""
+
+
 def main():
-    print("=" * 56)
+    print("=" * 60)
     print("  🎤  Rap Karaoke — Smart Installer")
-    print("=" * 56)
+    print("=" * 60)
 
     backend, hw_name = detect()
     icons = {"nvidia":"🟢","amd":"🔴","mps":"🍎","cpu":"⚪"}
     print(f"\n{icons.get(backend,'?')} Железо: {hw_name}")
     print(f"   Backend: {backend.upper()}")
+    print(f"   Python:  {sys.version.split()[0]}")
 
-    # --- HINT FOR SYSTEM DEPS ---
-    print("\n⚠️  Сначала убедитесь, что установлены системные зависимости!")
-    print("   Для работы аудио (GUI) и видео (ffmpeg) нужны:")
-    print("   - Arch:   sudo pacman -S ffmpeg portaudio")
-    print("   - Fedora: sudo dnf install ffmpeg portaudio-devel")
-    print("   - Ubuntu: sudo apt install ffmpeg libportaudio2 libportaudio-dev")
-    print("   Если зависимости не установлены, прервите скрипт (Ctrl+C), установите их и запустите снова.")
-    input("   Нажмите Enter, чтобы продолжить установку Python-пакетов...")
+    # ── AMD: предупреждение про Python версию ────────────────────────────────
+    if backend == "amd":
+        major, minor = sys.version_info.major, sys.version_info.minor
+        if minor >= 12:
+            print(f"\n⚠️  ВНИМАНИЕ: у тебя Python {major}.{minor}.")
+            print("   PyTorch для ROCm поддерживает только Python 3.10 и 3.11.")
+            print("   Рекомендуется создать окружение на 3.10 или 3.11 (см. подсказку ниже).")
+            print(ROCM_PYTHON_HINT)
+            go = input("   Продолжить всё равно? (y/n) [n]: ").strip().lower()
+            if go != "y":
+                print("   Прерываем. Создай окружение на Python 3.10/3.11 и запусти снова.")
+                sys.exit(0)
+        else:
+            print(ROCM_PYTHON_HINT)
 
-    # NVIDIA: спрашиваем версию CUDA
+    # ── Системные зависимости ─────────────────────────────────────────────────
+    print("\n⚠️  Системные зависимости (убедись, что установлены):")
+    print("   Arch:   sudo pacman -S ffmpeg portaudio")
+    print("   Fedora: sudo dnf install ffmpeg portaudio-devel")
+    print("   Ubuntu: sudo apt install ffmpeg libportaudio2 libportaudio-dev")
+    print("\n   PortAudio нужен для sounddevice (GUI-звук).")
+    print("   ffmpeg нужен для moviepy и воспроизведения аудио.")
+    input("\n   Нажми Enter, чтобы продолжить установку Python-пакетов…")
+
+    # ── CUDA версия для NVIDIA ────────────────────────────────────────────────
     torch_url = TORCH_URLS[backend]
     if backend == "nvidia":
-        print("\n  Версия драйвера / CUDA:")
-        print("  1) cu121 — CUDA 12.1  (RTX 20xx, 30xx, 40xx — рекомендуется)")
-        print("  2) cu118 — CUDA 11.8  (GTX 10xx, 16xx, старые RTX)")
+        print("\n  Какая версия CUDA? (см. nvidia-smi, строка CUDA Version)")
+        print("  1) CUDA 12.x  (RTX 20xx, 30xx, 40xx — большинство карт)")
+        print("  2) CUDA 11.8  (GTX 10xx, 16xx, RTX 20xx со старым драйвером)")
         choice = input("  Введи 1 или 2 [по умолчанию 1]: ").strip()
         if choice == "2":
             torch_url = "https://download.pytorch.org/whl/cu118"
-            print("  → Выбрано CUDA 11.8")
+            print("  → CUDA 11.8")
         else:
-            print("  → Выбрано CUDA 12.1")
+            print("  → CUDA 12.1")
 
-    if backend == "amd":
-        print(ROCM_HINT)
-
+    # ── Установка torch ───────────────────────────────────────────────────────
     print("\n📦 Устанавливаем torch + torchaudio…")
     if torch_url:
         pip_index(torch_url, "torch", "torchaudio")
     else:
-        # macOS MPS — берём с PyPI без index-url
         pip("torch", "torchaudio")
 
-    print("\n📦 Устанавливаем основные пакеты…")
+    # ── Основные пакеты ───────────────────────────────────────────────────────
+    print("\n📦 Устанавливаем зависимости…")
     audio_sep = AUDIO_SEP[backend]
     pip(*CORE, audio_sep)
 
-    print("\n📦 Проверяем torch…")
+    # ── Проверка torch ────────────────────────────────────────────────────────
+    print("\n🔍 Проверяем torch…")
+    check = (
+        "import torch; "
+        "cuda = torch.cuda.is_available(); "
+        "name = torch.cuda.get_device_name(0) if cuda else 'нет GPU'; "
+        "print(f'  CUDA: {cuda}  |  Устройство: {name}  |  torch {torch.__version__}')"
+    )
     try:
-        r = subprocess.run(
-            [sys.executable, "-c",
-             "import torch; print('CUDA:', torch.cuda.is_available(),"
-             "'device:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"],
-            capture_output=True, text=True)
-        print("  ", r.stdout.strip() or r.stderr.strip())
+        r = subprocess.run([sys.executable, "-c", check], capture_output=True, text=True)
+        print(r.stdout.strip() or ("  " + r.stderr.strip()[:200]))
     except: pass
 
     print("\n✅  Установка завершена!")
     print("   Запуск: python rap_karaoke_app.py")
 
     if backend == "amd":
-        print("\n⚠️  Если torch не видит GPU:")
-        print("   Убедись, что ROCm-драйвер загружен: rocm-smi")
-        print("   И torch установлен с ROCm-индексом (см. выше).")
+        print("\n💡 Если torch не видит GPU:")
+        print("   1. Проверь: rocm-smi — должны быть карты в списке")
+        print("   2. Добавь пользователя в группу: sudo usermod -aG video,render $USER")
+        print("   3. Перелогинься или выполни: newgrp render")
 
 
 if __name__ == "__main__":
