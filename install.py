@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+"""
+Rap Karaoke — Smart Installer
+==============================
+Определяет железо (NVIDIA / AMD / CPU) и устанавливает
+правильную версию torch + все зависимости.
+
+Запуск:
+    python install.py
+"""
+
+import sys, subprocess, shutil, platform, os
+from pathlib import Path
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  GPU DETECTION
+# ══════════════════════════════════════════════════════════════════════════════
+def detect() -> tuple[str, str]:
+    """Возвращает (backend, human_name): 'nvidia'|'amd'|'cpu'"""
+
+    # ── NVIDIA ────────────────────────────────────────────────────────────────
+    if shutil.which("nvidia-smi"):
+        try:
+            r = subprocess.run(
+                ["nvidia-smi","--query-gpu=name,driver_version","--format=csv,noheader"],
+                capture_output=True, text=True, timeout=10)
+            if r.returncode == 0 and r.stdout.strip():
+                lines = r.stdout.strip().splitlines()
+                name  = lines[0].split(",")[0].strip()
+                return "nvidia", f"NVIDIA {name}"
+        except Exception as e:
+            print(f"  nvidia-smi error: {e}")
+
+    # ── AMD ROCm ──────────────────────────────────────────────────────────────
+    rocm_smi  = shutil.which("rocm-smi")
+    kfd_nodes = Path("/sys/class/kfd/kfd/topology/nodes")
+    amd_found = kfd_nodes.exists()
+
+    if rocm_smi:
+        try:
+            r = subprocess.run(["rocm-smi","--showproductname"],
+                               capture_output=True, text=True, timeout=10)
+            if r.returncode == 0:
+                amd_found = True
+                for line in r.stdout.splitlines():
+                    if "GPU" in line.upper() or "Radeon" in line:
+                        name = line.strip().split(":")[-1].strip()
+                        return "amd", f"AMD {name} (ROCm)"
+        except: pass
+
+    if amd_found:
+        return "amd", "AMD GPU (ROCm)"
+
+    # ── Apple Silicon ─────────────────────────────────────────────────────────
+    if platform.system() == "Darwin" and platform.machine() == "arm64":
+        return "mps", f"Apple Silicon ({platform.processor()})"
+
+    # ── CPU ───────────────────────────────────────────────────────────────────
+    import multiprocessing
+    cores = multiprocessing.cpu_count()
+    return "cpu", f"CPU ({platform.processor() or 'unknown'}, {cores} ядер)"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  TORCH INDEX URLS
+# ══════════════════════════════════════════════════════════════════════════════
+TORCH_URLS = {
+    "nvidia": "https://download.pytorch.org/whl/cu121",   # CUDA 12.1
+    "amd":    "https://download.pytorch.org/whl/rocm6.0", # ROCm 6.0
+    "mps":    None,                                        # pip default (macOS)
+    "cpu":    "https://download.pytorch.org/whl/cpu",
+}
+
+# audio-separator: ONNX Runtime с GPU ускорением
+AUDIO_SEP = {
+    "nvidia": "audio-separator[gpu]",  # ONNX Runtime + CUDA
+    "amd":    "audio-separator[cpu]",  # ROCm через ONNX пока нестабилен
+    "mps":    "audio-separator[cpu]",
+    "cpu":    "audio-separator[cpu]",
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PACKAGES
+# ══════════════════════════════════════════════════════════════════════════════
+CORE = [
+    # Обработка аудио
+    "demucs",
+    "openai-whisper",
+    "whisperx",
+    # Видео (legacy build_video)
+    "moviepy==1.0.3",
+    # Изображения
+    "Pillow",
+    "numpy",
+    # Сеть + скрейпинг
+    "requests",
+    "beautifulsoup4",
+    "yt-dlp",
+    # Фонетика
+    "jellyfish",
+    # GUI
+    "PyQt6",
+    # Аудио RT
+    "sounddevice",
+    "soundfile",
+    # Анализ
+    "librosa",
+]
+
+
+def pip(*args, **kwargs):
+    subprocess.run([sys.executable, "-m", "pip", "install", *args], check=True, **kwargs)
+
+
+def pip_index(url:str, *packages):
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install",
+         "--index-url", url, *packages],
+        check=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ROCM SYSTEM PACKAGES HINT
+# ══════════════════════════════════════════════════════════════════════════════
+ROCM_HINT = """
+──────────────────────────────────────────────────────────────
+  AMD ROCm — системные пакеты (если ещё не установлены):
+
+  Arch Linux:
+    sudo pacman -S rocm-opencl-runtime hip-runtime-amd
+
+  Ubuntu 22.04 / 24.04:
+    sudo apt install rocm-dev
+
+  Подробная инструкция:
+    https://rocm.docs.amd.com/en/latest/deploy/linux/index.html
+──────────────────────────────────────────────────────────────
+"""
+
+CUDA_VERSIONS = {
+    "cu121": "CUDA 12.1 (GTX 16xx / RTX 20xx-40xx)",
+    "cu118": "CUDA 11.8 (GTX 10xx / старые RTX)",
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+def main():
+    print("=" * 56)
+    print("  🎤  Rap Karaoke — Smart Installer")
+    print("=" * 56)
+
+    backend, hw_name = detect()
+    icons = {"nvidia":"🟢","amd":"🔴","mps":"🍎","cpu":"⚪"}
+    print(f"\n{icons.get(backend,'?')} Железо: {hw_name}")
+    print(f"   Backend: {backend.upper()}")
+
+    # --- HINT FOR SYSTEM DEPS ---
+    print("\n⚠️  Сначала убедитесь, что установлены системные зависимости!")
+    print("   Для работы аудио (GUI) и видео (ffmpeg) нужны:")
+    print("   - Arch:   sudo pacman -S ffmpeg portaudio")
+    print("   - Fedora: sudo dnf install ffmpeg portaudio-devel")
+    print("   - Ubuntu: sudo apt install ffmpeg libportaudio2 libportaudio-dev")
+    print("   Если зависимости не установлены, прервите скрипт (Ctrl+C), установите их и запустите снова.")
+    input("   Нажмите Enter, чтобы продолжить установку Python-пакетов...")
+
+    # NVIDIA: спрашиваем версию CUDA
+    torch_url = TORCH_URLS[backend]
+    if backend == "nvidia":
+        print("\n  Версия драйвера / CUDA:")
+        print("  1) cu121 — CUDA 12.1  (RTX 20xx, 30xx, 40xx — рекомендуется)")
+        print("  2) cu118 — CUDA 11.8  (GTX 10xx, 16xx, старые RTX)")
+        choice = input("  Введи 1 или 2 [по умолчанию 1]: ").strip()
+        if choice == "2":
+            torch_url = "https://download.pytorch.org/whl/cu118"
+            print("  → Выбрано CUDA 11.8")
+        else:
+            print("  → Выбрано CUDA 12.1")
+
+    if backend == "amd":
+        print(ROCM_HINT)
+
+    print("\n📦 Устанавливаем torch + torchaudio…")
+    if torch_url:
+        pip_index(torch_url, "torch", "torchaudio")
+    else:
+        # macOS MPS — берём с PyPI без index-url
+        pip("torch", "torchaudio")
+
+    print("\n📦 Устанавливаем основные пакеты…")
+    audio_sep = AUDIO_SEP[backend]
+    pip(*CORE, audio_sep)
+
+    print("\n📦 Проверяем torch…")
+    try:
+        r = subprocess.run(
+            [sys.executable, "-c",
+             "import torch; print('CUDA:', torch.cuda.is_available(),"
+             "'device:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"],
+            capture_output=True, text=True)
+        print("  ", r.stdout.strip() or r.stderr.strip())
+    except: pass
+
+    print("\n✅  Установка завершена!")
+    print("   Запуск: python rap_karaoke_app.py")
+
+    if backend == "amd":
+        print("\n⚠️  Если torch не видит GPU:")
+        print("   Убедись, что ROCm-драйвер загружен: rocm-smi")
+        print("   И torch установлен с ROCm-индексом (см. выше).")
+
+
+if __name__ == "__main__":
+    main()

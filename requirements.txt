@@ -1,0 +1,60 @@
+# ══════════════════════════════════════════════════════
+#  Rap Karaoke — зависимости
+# ══════════════════════════════════════════════════════
+
+# Разделение вокал/минус
+demucs
+
+# UVR разделение вокал/минус (v2)
+audio-separator
+
+# Аудио-бэкенд для сохранения WAV (нужен для torchaudio)
+soundfile
+
+# STT с пословными таймингами
+openai-whisper
+
+# Forced alignment (wav2vec2)
+whisperx
+
+# Видео
+moviepy==1.0.3
+
+# Рендер кадров
+Pillow
+numpy
+
+# Скрейпинг текстов
+requests
+beautifulsoup4
+
+# Фонетическая коррекция сленга
+jellyfish
+
+
+# ══════════════════════════════════════════════════════
+#  torch — ВЫБЕРИ ОДНУ СТРОКУ под своё железо:
+# ══════════════════════════════════════════════════════
+#
+#  NVIDIA (CUDA 12.1):
+#    pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+#
+#  NVIDIA (CUDA 11.8, старые карты GTX 10xx / 16xx):
+#    pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu118
+#
+#  AMD Radeon (ROCm 6.0, Linux):
+#    pip install torch torchaudio --index-url https://download.pytorch.org/whl/rocm6.0
+#
+#  AMD Radeon (ROCm 5.7, старые карты RX 5xxx/6xxx):
+#    pip install torch torchaudio --index-url https://download.pytorch.org/whl/rocm5.7
+#
+#  CPU (любое железо, медленнее):
+#    pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+#
+# ══════════════════════════════════════════════════════
+#  Системные зависимости:
+#    Arch:   sudo pacman -S ffmpeg portaudio rocm-opencl-runtime (для AMD)
+#    Ubuntu: sudo apt install ffmpeg libportaudio2 libportaudio-dev
+#    Fedora: sudo dnf install ffmpeg portaudio-devel
+#            AMD ROCm: https://rocm.docs.amd.com/en/latest/deploy/linux/index.html
+# ══════════════════════════════════════════════════════
